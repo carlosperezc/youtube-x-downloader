@@ -1,0 +1,347 @@
+// ==UserScript==
+// @name         X (Twitter) Bookmarks → CSV Exporter
+// @namespace    local.bookmarks.exporter
+// @version      1.0.0
+// @description  Captures your X/Twitter bookmarks as you scroll and exports them to a CSV file. Runs entirely client-side, read-only, no credentials or external servers involved.
+// @author       you
+// @match        https://x.com/i/bookmarks*
+// @match        https://twitter.com/i/bookmarks*
+// @run-at       document-start
+// @grant        none
+// ==/UserScript==
+
+// NOTE: @grant must stay "none". With @grant none, Tampermonkey injects
+// this script directly into the page's own JS context, which is required
+// for the fetch/XHR patches below to actually intercept the page's own
+// network calls. Adding any @grant value switches Tampermonkey into a
+// sandboxed mode where window.fetch/XMLHttpRequest patches won't see the
+// page's real traffic.
+
+/*
+  HOW THIS WORKS (read this before running it)
+  ----------------------------------------------
+  1. X's bookmarks page is a single-page app. When you scroll, the page
+     itself calls an internal GraphQL endpoint (something like
+     ".../graphql/.../Bookmarks") to fetch the next batch of tweets.
+  2. This script does NOT call that endpoint itself and does NOT touch
+     your cookies, auth tokens, or any credentials. It simply wraps the
+     browser's built-in `fetch` function so that when the PAGE makes
+     that call (because you scrolled), the script also gets to look at
+     the response that comes back — the same data your browser already
+     received and would have rendered on screen anyway.
+  3. It parses out: tweet id, author name/handle, full text, the tweet's
+     own permalink, and an ISO 8601 timestamp.
+  4. It stores everything in an in-memory array (nothing persisted to
+     disk, nothing sent anywhere).
+  5. It adds one floating button to the page: "Export N bookmarks (CSV)".
+     Clicking it generates a CSV in memory and triggers a normal browser
+     file download. That's the only side effect this script has.
+     CSV columns: Text,DisplayName,Username,Timestamp,Link
+
+  WHAT TO DO
+  ----------
+  1. Open https://x.com/i/bookmarks
+  2. Scroll down slowly through your whole bookmarks list — the script
+     can only capture what X's own page loads, so you need to actually
+     scroll past everything you want exported. The on-screen counter
+     tells you how many unique bookmarks have been captured so far.
+  3. Click "Export N bookmarks (CSV)" when you're done.
+
+  LIMITATIONS
+  -----------
+  - This is NOT automatic background scraping with no effort — you (or
+    a small auto-scroll helper, included below but OFF by default) need
+    to load every bookmark at least once by scrolling.
+  - If X changes their internal API response shape, the parsing logic
+    below may need small tweaks (look at the `extractTweetsFromJSON`
+    function).
+  - Long tweet text containing quotes/commas is safely escaped for CSV,
+    but always sanity check the output file before relying on it.
+*/
+
+(function () {
+  'use strict';
+
+  // Set to true to log every API URL the page makes to the console.
+  // Useful for diagnosing why nothing is being captured.
+  const DEBUG = true;
+
+  const captured = new Map(); // tweetId -> row object
+  let lastCount = 0;
+
+  if (DEBUG) {
+    console.log('[bookmarks-exporter] script loaded on', location.href);
+  }
+
+  // ---- 1. Wrap fetch AND XMLHttpRequest to observe API responses ----
+  // X's web app has used both fetch() and XHR for internal API calls at
+  // different times, so we hook both to be safe. Neither hook modifies
+  // the request — they only look at responses after the page already
+  // triggered them.
+
+  function maybeHandleUrl(url, getJSON) {
+    if (!url) return;
+    const isGraphQL = url.includes('/graphql/');
+    const looksBookmarky = /bookmark/i.test(url);
+
+    if (DEBUG && isGraphQL) {
+      console.log('[bookmarks-exporter] saw GraphQL call:', url);
+    }
+
+    if (isGraphQL && looksBookmarky) {
+      getJSON()
+        .then((json) => {
+          if (DEBUG) console.log('[bookmarks-exporter] parsing response from', url);
+          extractTweetsFromJSON(json);
+        })
+        .catch((e) => {
+          if (DEBUG) console.warn('[bookmarks-exporter] could not parse JSON from', url, e);
+        });
+    }
+  }
+
+  // -- fetch hook --
+  const originalFetch = window.fetch;
+  window.fetch = async function (...args) {
+    const response = await originalFetch.apply(this, args);
+    try {
+      const url = typeof args[0] === 'string' ? args[0] : args[0]?.url || '';
+      maybeHandleUrl(url, () => response.clone().json());
+    } catch (e) {
+      console.warn('[bookmarks-exporter] non-fatal error inspecting fetch response', e);
+    }
+    return response;
+  };
+
+  // -- XHR hook --
+  const OriginalXHR = window.XMLHttpRequest;
+  const originalOpen = OriginalXHR.prototype.open;
+  const originalSend = OriginalXHR.prototype.send;
+
+  OriginalXHR.prototype.open = function (method, url, ...rest) {
+    this.__bmExporterUrl = url;
+    return originalOpen.call(this, method, url, ...rest);
+  };
+
+  OriginalXHR.prototype.send = function (...args) {
+    this.addEventListener('load', function () {
+      try {
+        const url = this.__bmExporterUrl || '';
+        maybeHandleUrl(url, () => Promise.resolve().then(() => JSON.parse(this.responseText)));
+      } catch (e) {
+        console.warn('[bookmarks-exporter] non-fatal error inspecting XHR response', e);
+      }
+    });
+    return originalSend.apply(this, args);
+  };
+
+  // ---- 2. Walk the GraphQL JSON tree looking for tweet result objects ----
+  function extractTweetsFromJSON(json) {
+    const found = [];
+    walk(json, found);
+
+    if (DEBUG) {
+      console.log(`[bookmarks-exporter] found ${found.length} tweet node(s) in this response`);
+    }
+
+    let newOnes = 0;
+    for (const tweet of found) {
+      if (tweet.id && !captured.has(tweet.id)) {
+        captured.set(tweet.id, tweet);
+        newOnes++;
+      }
+    }
+    if (newOnes > 0) updateButtonLabel();
+  }
+
+  function walk(node, out) {
+    if (!node || typeof node !== 'object') return;
+
+    // X's GraphQL responses nest tweets under keys like "tweet_results"
+    // -> "result" with a "legacy" object holding the classic tweet fields.
+    if (node.__typename === 'Tweet' || (node.legacy && node.rest_id)) {
+      const row = parseTweetNode(node);
+      if (row) out.push(row);
+    }
+
+    for (const key in node) {
+      if (Object.prototype.hasOwnProperty.call(node, key)) {
+        const val = node[key];
+        if (val && typeof val === 'object') {
+          walk(val, out);
+        }
+      }
+    }
+  }
+
+  function parseTweetNode(node) {
+    try {
+      const legacy = node.legacy || node;
+      const id = node.rest_id || legacy.id_str;
+      if (!id) return null;
+
+      const userResultRoot = node.core?.user_results?.result;
+
+      // X has been migrating user fields out of the old "legacy" object
+      // into a newer typed "core" sub-object on the user. Check both
+      // locations, newer "core" first, since that's where current
+      // responses put name/screen_name.
+      const name =
+        userResultRoot?.core?.name ||
+        userResultRoot?.legacy?.name ||
+        userResultRoot?.name ||
+        '';
+      const handle =
+        userResultRoot?.core?.screen_name ||
+        userResultRoot?.legacy?.screen_name ||
+        userResultRoot?.screen_name ||
+        '';
+
+      const rawText =
+        legacy.full_text ||
+        node.note_tweet?.note_tweet_results?.result?.text ||
+        legacy.text ||
+        '';
+      // Collapse any line breaks in the tweet's own text into spaces so
+      // each bookmark always occupies exactly one physical line in the
+      // exported CSV (a quoted field containing \n is valid CSV, but
+      // some viewers/tools display it as multiple lines, which we want
+      // to avoid here).
+      const text = rawText.replace(/\r\n|\r|\n/g, ' ').trim();
+
+      const createdAtRaw = legacy.created_at || '';
+      // X sends created_at as RFC 2822, e.g. "Tue Jun 02 12:44:36 +0000 2026".
+      // Convert to ISO 8601 to match the requested CSV format, e.g.
+      // "2026-06-02T12:44:36.000Z". Falls back to the raw string if parsing fails.
+      let createdAt = createdAtRaw;
+      if (createdAtRaw) {
+        const parsed = new Date(createdAtRaw);
+        if (!isNaN(parsed.getTime())) {
+          createdAt = parsed.toISOString();
+        }
+      }
+      const url = handle && id ? `https://x.com/${handle}/status/${id}` : '';
+
+      // Skip tombstones / unavailable / ad placeholder nodes: these have
+      // a rest_id but essentially no real content (deleted bookmarked
+      // tweets, suspended-author tweets, promoted slots, etc). If we
+      // have neither a handle nor any text, this isn't a real tweet
+      // worth exporting — drop it instead of writing a blank row.
+      if (!handle && !text) {
+        if (DEBUG) {
+          console.log('[bookmarks-exporter] skipping empty/tombstone node, id:', id);
+        }
+        return null;
+      }
+
+      return {
+        id,
+        author_name: name,
+        author_handle: handle,
+        text,
+        created_at: createdAt,
+        url,
+        likes: legacy.favorite_count ?? '',
+        retweets: legacy.retweet_count ?? '',
+        replies: legacy.reply_count ?? '',
+        views: node.views?.count ?? '',
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  // ---- 3. Floating UI: counter + export button ----
+  function injectUI() {
+    if (document.getElementById('bm-exporter-btn')) return;
+
+    const btn = document.createElement('button');
+    btn.id = 'bm-exporter-btn';
+    btn.textContent = 'Export 0 bookmarks (CSV)';
+    btn.style.cssText = `
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      z-index: 999999;
+      padding: 12px 18px;
+      background: #1d9bf0;
+      color: white;
+      border: none;
+      border-radius: 999px;
+      font-size: 14px;
+      font-weight: 600;
+      font-family: -apple-system, sans-serif;
+      cursor: pointer;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.25);
+    `;
+    btn.addEventListener('click', exportCSV);
+    document.body.appendChild(btn);
+  }
+
+  function updateButtonLabel() {
+    const btn = document.getElementById('bm-exporter-btn');
+    if (btn && captured.size !== lastCount) {
+      lastCount = captured.size;
+      btn.textContent = `Export ${captured.size} bookmarks (CSV)`;
+    }
+  }
+
+  // ---- 4. CSV generation + download ----
+  function csvEscape(value) {
+    // Always wrap every field in double quotes, escaping internal quotes
+    // by doubling them, regardless of whether the field needs it. This
+    // matches the requested format: "Text","DisplayName","Username",...
+    const str = String(value ?? '');
+    return `"${str.replace(/"/g, '""')}"`;
+  }
+
+  function exportCSV() {
+    // Output column order/names as requested:
+    // Text,DisplayName,Username,Timestamp,Link
+    const headers = ['Text', 'DisplayName', 'Username', 'Timestamp', 'Link'];
+
+    const rows = [headers.join(',')];
+    for (const row of captured.values()) {
+      const values = [
+        row.text,
+        row.author_name,
+        row.author_handle ? `@${row.author_handle}` : '',
+        row.created_at, // already ISO 8601, e.g. 2026-06-02T12:44:36.000Z
+        row.url,
+      ];
+      rows.push(values.map(csvEscape).join(','));
+    }
+
+    const csvContent = rows.join('\n');
+    const blob = new Blob(['\uFEFF' + csvContent], {
+      type: 'text/csv;charset=utf-8;',
+    });
+    const link = document.createElement('a');
+    const ts = new Date().toISOString().slice(0, 10);
+    link.href = URL.createObjectURL(blob);
+    link.download = `x-bookmarks-${ts}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  }
+
+  // ---- 5. Optional: gentle auto-scroll helper (OFF by default) ----
+  // Set AUTO_SCROLL = true below if you want the page to scroll itself
+  // every few seconds instead of you scrolling manually. Left off by
+  // default so you stay in control of pacing (and so this script can't
+  // be accused of "automating" anything beyond observing).
+  const AUTO_SCROLL = false;
+  if (AUTO_SCROLL) {
+    setInterval(() => {
+      window.scrollBy(0, window.innerHeight * 0.8);
+    }, 2500);
+  }
+
+  // ---- boot ----
+  const boot = () => injectUI();
+  if (document.readyState === 'complete' || document.readyState === 'interactive') {
+    setTimeout(boot, 1000);
+  } else {
+    window.addEventListener('DOMContentLoaded', () => setTimeout(boot, 1000));
+  }
+})();
